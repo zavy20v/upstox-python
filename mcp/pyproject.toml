@@ -1,0 +1,48 @@
+[project]
+name = "upstox-mcp"
+version = "1.0.0"
+description = "MCP server wrapping the Upstox Python SDK for trading and market data"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Upstox", email = "developer@upstox.com"}
+]
+keywords = ["mcp", "model-context-protocol", "upstox", "trading", "broker", "india"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Python :: 3",
+    "Framework :: MCP",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "upstox-python>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+upstox-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+asyncio_mode = "auto"
