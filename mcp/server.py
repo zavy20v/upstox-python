@@ -28,6 +28,7 @@ Example config.yaml entry:
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import logging
 import os
@@ -67,9 +68,9 @@ def _load_upstox_client():
         pass
 
     # Try local upstox_client/
-    local_path = os.path.join(os.path.dirname(__file__), "upstox_client")
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upstox_client")
     if os.path.isdir(local_path):
-        sys.path.insert(0, os.path.dirname(__file__))
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         try:
             import upstox_client
             return upstox_client
@@ -132,6 +133,11 @@ def _serialise(obj: Any) -> Any:
         return base64.b64encode(obj).decode()
     if isinstance(obj, list):
         return [_serialise(item) for item in obj]
+    # SDK model objects — use to_dict() if available
+    if hasattr(obj, "to_dict"):
+        return _serialise(obj.to_dict())
+    if isinstance(obj, dict):
+        return {k: _serialise(v) for k, v in obj.items()}
     if hasattr(obj, "__dict__"):
         out = {}
         for k, v in obj.__dict__.items():
@@ -145,8 +151,20 @@ def _call_api(api_method, **kwargs) -> dict:
     """
     Call an SDK API method, catch errors, and return a JSON-compatible result.
     Result shape: {"ok": true, "data": ...} or {"ok": false, "error": "..."}
+    Strips 'api_version' from kwargs if the method doesn't accept it explicitly.
     """
     try:
+        sig = inspect.signature(api_method)
+        params = set(sig.parameters.keys())
+        # Check if method has **kwargs
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        # Only pass api_version if method explicitly declares it or has **kwargs
+        # that the SDK actually accepts (some SDK methods reject unknown kwargs)
+        if "api_version" in kwargs and "api_version" not in params:
+            kwargs = {k: v for k, v in kwargs.items() if k != "api_version"}
         result = api_method(**kwargs)
         return {"ok": True, "data": _serialise(result)}
     except Exception as exc:
@@ -269,12 +287,19 @@ def get_ohlc(instrument_key: str, interval: str = "1minute") -> dict:
     """
     Get OHLC quotes for one or more instruments.
     instrument_key: comma-separated instrument keys.
-    interval: one of 1minute, 5minute, 15minute, 30minute, 1hour, 1day.
+    interval: 1minute, 5minute, 15minute, 30minute, 1hour, 1day.
     """
+    # Use V2 API which has explicit interval param
+    # Valid intervals per Upstox API: 1min, 5min, 15min, 30min, 1hour, 1day
+    interval_map = {
+        "1minute": "1min", "5minute": "5min", "15minute": "15min",
+        "30minute": "30min", "1hour": "1hour", "1day": "1day",
+    }
+    api_interval = interval_map.get(interval, interval)
     sdk = _load_upstox_client()
-    api = sdk.MarketQuoteV3Api(_get_client())
-    return _call_api(api.get_market_quote_ohlc, interval=interval,
-                     instrument_key=instrument_key)
+    api = sdk.MarketQuoteApi(_get_client())
+    return _call_api(api.get_market_quote_ohlc, symbol=instrument_key,
+                     interval=api_interval, api_version="v2")
 
 
 @mcp.tool()
@@ -286,19 +311,22 @@ def get_option_greeks(instrument_key: str) -> dict:
 
 
 @mcp.tool()
-def get_market_quote_full(instrument_key: str) -> dict:
+def get_market_quote_full(instrument_key: str, api_version: str = "v2") -> dict:
     """Get full market quote (full depth orderbook) for an instrument."""
     sdk = _load_upstox_client()
     api = sdk.MarketQuoteApi(_get_client())
-    return _call_api(api.get_full_market_quote, instrument_key=instrument_key)
+    return _call_api(api.get_full_market_quote, symbol=instrument_key,
+                     api_version=api_version)
 
 
 @mcp.tool()
-def get_market_status(api_version: str = "v2") -> dict:
-    """Get current market status (open/closed/pre-open) for all exchanges."""
+def get_market_status(exchange: str = "NSE") -> dict:
+    """Get current market status (open/closed/pre-open) for an exchange.
+    exchange: NSE, BSE, NFO, MCX, BFO, CDS, BSE_INDEX, NSE_INDEX
+    """
     sdk = _load_upstox_client()
-    api = sdk.MarketApi(_get_client())
-    return _call_api(api.get_market_status, api_version=api_version)
+    api = sdk.MarketHolidaysAndTimingsApi(_get_client())
+    return _call_api(api.get_market_status, exchange=exchange)
 
 
 @mcp.tool()
@@ -306,7 +334,7 @@ def get_market_holidays(api_version: str = "v2") -> dict:
     """Get list of market holidays."""
     sdk = _load_upstox_client()
     api = sdk.MarketHolidaysAndTimingsApi(_get_client())
-    return _call_api(api.get_exchange_timing, api_version=api_version)
+    return _call_api(api.get_holidays, api_version=api_version)
 
 
 # -------------------------------------------------------------------------
@@ -321,20 +349,22 @@ def search_instruments(exchange: str, symbol: str, api_version: str = "v2") -> d
     """
     sdk = _load_upstox_client()
     api = sdk.InstrumentsApi(_get_client())
-    return _call_api(api.search_instruments, exchange=exchange, symbol=symbol,
-                     api_version=api_version)
+    return _call_api(api.search_instrument, query=symbol,
+                     exchanges=exchange, api_version=api_version)
 
 
 @mcp.tool()
 def get_instrument_symbol(exchange: str, symbol: str, instrument_type: str = "EQ",
                            expiry: str = "", strike_price: str = "",
                            api_version: str = "v2") -> dict:
-    """Get instrument key for a given exchange + symbol combination."""
+    """Get instrument key for a given exchange + symbol combination.
+    Uses search_instrument under the hood and returns the first match.
+    """
     sdk = _load_upstox_client()
     api = sdk.InstrumentsApi(_get_client())
-    return _call_api(api.get_instrument_symbol, exchange=exchange, symbol=symbol,
-                     instrument_type=instrument_type, expiry=expiry,
-                     strike_price=strike_price, api_version=api_version)
+    return _call_api(api.search_instrument, query=symbol,
+                     exchanges=exchange, instrument_types=instrument_type,
+                     expiry=expiry or None, api_version=api_version)
 
 
 # -------------------------------------------------------------------------
@@ -343,18 +373,14 @@ def get_instrument_symbol(exchange: str, symbol: str, instrument_type: str = "EQ
 
 @mcp.tool()
 def get_option_chain(instrument_key: str, expiry_date: str = "",
-                      strike_price: str = "", right: str = "", limit: int = 10,
                       api_version: str = "v2") -> dict:
-    """
-    Get option chain for an underlying.
-    right: PUT or CALL (optional filter).
-    limit: max results per side (default 10).
-    """
+    """Get option chain for an underlying. expiry_date format: YYYY-MM-DD"""
     sdk = _load_upstox_client()
     api = sdk.OptionsApi(_get_client())
-    return _call_api(api.get_option_chain, instrument_key=instrument_key,
-                     expiry_date=expiry_date, strike_price=strike_price,
-                     right=right, limit=limit, api_version=api_version)
+    return _call_api(api.get_put_call_option_chain,
+                     instrument_key=instrument_key,
+                     expiry_date=expiry_date,
+                     api_version=api_version)
 
 
 @mcp.tool()
@@ -362,7 +388,7 @@ def get_expiries(instrument_key: str, api_version: str = "v2") -> dict:
     """Get available expiry dates for a derivative instrument."""
     sdk = _load_upstox_client()
     api = sdk.ExpiredInstrumentApi(_get_client())
-    return _call_api(api.get_expired_futures_contract,
+    return _call_api(api.get_expiries,
                      instrument_key=instrument_key, api_version=api_version)
 
 
@@ -373,15 +399,25 @@ def get_expiries(instrument_key: str, api_version: str = "v2") -> dict:
 @mcp.tool()
 def get_historical_candles(instrument_key: str, interval: str, start_time: str,
                              end_time: str, api_version: str = "v3") -> dict:
-    """
-    Get historical OHLCV candles.
+    """Get historical OHLCV candles.
     interval: 1minute, 5minute, 15minute, 30minute, 1hour, 1day.
-    start_time / end_time: RFC 3339 / ISO 8601 format, e.g. "2025-01-01T09:15:00Z"
+    start_time / end_time: ISO 8601 format, e.g. "2025-01-01T09:15:00Z"
     """
+    interval_map = {
+        "1minute": (1, "minutes"), "5minute": (5, "minutes"),
+        "15minute": (15, "minutes"), "30minute": (30, "minutes"),
+        "1hour": (60, "minutes"), "1day": (1, "days"),
+    }
+    api_interval, unit = interval_map.get(interval, (1, "minutes"))
+    # Convert ISO 8601 to yyyy-mm-dd format
+    from_date = start_time[:10] if "T" in start_time else start_time
+    to_date = end_time[:10] if "T" in end_time else end_time
     sdk = _load_upstox_client()
     api = sdk.HistoryV3Api(_get_client())
-    return _call_api(api.get_historical_candle, instrument_key=instrument_key,
-                     interval=interval, start_time=start_time, end_time=end_time,
+    return _call_api(api.get_historical_candle_data1,
+                     instrument_key=instrument_key,
+                     unit=unit, interval=api_interval,
+                     to_date=to_date, from_date=from_date,
                      api_version=api_version)
 
 
@@ -389,10 +425,18 @@ def get_historical_candles(instrument_key: str, interval: str, start_time: str,
 def get_intra_day_candles(instrument_key: str, interval: str = "1minute",
                            api_version: str = "v3") -> dict:
     """Get intra-day (live) candle data for today."""
+    interval_map = {
+        "1minute": 1, "5minute": 5, "15minute": 15,
+        "30minute": 30, "1hour": 60,
+        "1min": 1, "5min": 5, "15min": 15, "30min": 30,
+    }
+    api_interval = interval_map.get(interval, 1)
     sdk = _load_upstox_client()
     api = sdk.HistoryV3Api(_get_client())
-    return _call_api(api.get_intra_day_candle, instrument_key=instrument_key,
-                     interval=interval, api_version=api_version)
+    return _call_api(api.get_intra_day_candle_data,
+                     instrument_key=instrument_key,
+                     unit="minutes", interval=api_interval,
+                     api_version=api_version)
 
 
 # -------------------------------------------------------------------------
@@ -522,10 +566,10 @@ def convert_position(body: dict, api_version: str = "v2") -> dict:
     body: dict with ConvertPositionRequest fields.
     """
     sdk = _load_upstox_client()
-    api = sdk.PostTradeApi(_get_client())
+    api = sdk.PortfolioApi(_get_client())
     model_cls = sdk.ConvertPositionRequest
     body_obj = model_cls(**body) if isinstance(body, dict) else body
-    return _call_api(api.convert_position, body=body_obj, api_version=api_version)
+    return _call_api(api.convert_positions, body=body_obj, api_version=api_version)
 
 
 @mcp.tool()
@@ -542,29 +586,21 @@ def exit_all_positions(tag: str = "", segment: str = "", api_version: str = "v2"
 # -------------------------------------------------------------------------
 
 @mcp.tool()
-def place_gtt_order(body: dict, api_version: str = "v2") -> dict:
-    """Place a GTT (trigger) order."""
-    sdk = _load_upstox_client()
-    api = sdk.OrderApi(_get_client())
-    model_cls = sdk.GttPlaceOrderRequest
-    body_obj = model_cls(**body) if isinstance(body, dict) else body
-    return _call_api(api.place_gtt_order, body=body_obj, api_version=api_version)
+def get_gtt_orders() -> dict:
+    """Get all GTT orders. NOTE: GTT is not supported in this SDK version."""
+    return {"ok": False, "error": "GTT orders are not supported by the current Upstox SDK. Upgrade the SDK to use GTT features."}
 
 
 @mcp.tool()
-def cancel_gtt_order(order_id: str, api_version: str = "v2") -> dict:
-    """Cancel a GTT order."""
-    sdk = _load_upstox_client()
-    api = sdk.OrderApi(_get_client())
-    return _call_api(api.cancel_gtt_order, order_id=order_id, api_version=api_version)
+def place_gtt_order(body: dict) -> dict:
+    """Place a GTT (trigger) order. NOTE: GTT is not supported in this SDK version."""
+    return {"ok": False, "error": "GTT orders are not supported by the current Upstox SDK. Upgrade the SDK to use GTT features."}
 
 
 @mcp.tool()
-def get_gtt_orders(api_version: str = "v2") -> dict:
-    """Get all GTT orders."""
-    sdk = _load_upstox_client()
-    api = sdk.OrderApi(_get_client())
-    return _call_api(api.get_gtt_order, api_version=api_version)
+def cancel_gtt_order(order_id: str) -> dict:
+    """Cancel a GTT order. NOTE: GTT is not supported in this SDK version."""
+    return {"ok": False, "error": "GTT orders are not supported by the current Upstox SDK. Upgrade the SDK to use GTT features."}
 
 
 # -------------------------------------------------------------------------
@@ -576,7 +612,7 @@ def get_mf_holdings(api_version: str = "v2") -> dict:
     """Get mutual fund holdings."""
     sdk = _load_upstox_client()
     api = sdk.MutualFundApi(_get_client())
-    return _call_api(api.get_holdings, api_version=api_version)
+    return _call_api(api.get_mutual_fund_holdings, api_version=api_version)
 
 
 @mcp.tool()
@@ -584,7 +620,7 @@ def get_mf_orders(api_version: str = "v2") -> dict:
     """Get mutual fund orders."""
     sdk = _load_upstox_client()
     api = sdk.MutualFundApi(_get_client())
-    return _call_api(api.get_orders, api_version=api_version)
+    return _call_api(api.get_mutual_fund_orders, api_version=api_version)
 
 
 @mcp.tool()
@@ -592,7 +628,7 @@ def get_mf_sips(api_version: str = "v2") -> dict:
     """Get mutual fund SIPs."""
     sdk = _load_upstox_client()
     api = sdk.MutualFundApi(_get_client())
-    return _call_api(api.get_sips, api_version=api_version)
+    return _call_api(api.get_mutual_fund_sips, api_version=api_version)
 
 
 # -------------------------------------------------------------------------
@@ -600,12 +636,19 @@ def get_mf_sips(api_version: str = "v2") -> dict:
 # -------------------------------------------------------------------------
 
 @mcp.tool()
-def get_news(instrument_key: str = "", api_version: str = "v2") -> dict:
-    """Get latest news for an instrument (or all news if instrument_key empty)."""
+def get_news(category: str = "holdings", instrument_keys: str = "",
+              page_number: int = 1, page_size: int = 100) -> dict:
+    """Get latest news for instruments, positions, or holdings.
+    category: instrument_keys, positions, or holdings
+    instrument_keys: comma-separated instrument keys (required when category is instrument_keys)
+    """
     sdk = _load_upstox_client()
     api = sdk.NewsApi(_get_client())
-    return _call_api(api.get_news, instrument_key=instrument_key,
-                     api_version=api_version)
+    kwargs: dict = {"category": category,
+                    "page_number": page_number, "page_size": page_size}
+    if instrument_keys:
+        kwargs["instrument_keys"] = instrument_keys
+    return _call_api(api.get_news, **kwargs)
 
 
 # -------------------------------------------------------------------------
@@ -647,13 +690,19 @@ def get_competitors(instrument_key: str, api_version: str = "v2") -> dict:
 def get_brokerage_charges(body: dict, api_version: str = "v2") -> dict:
     """
     Calculate brokerage, taxes, and charges for a proposed trade.
-    body: dict matching PlaceOrderRequest fields.
+    body: dict with keys: instrument_token, quantity, product, transaction_type, price
     """
     sdk = _load_upstox_client()
     api = sdk.ChargeApi(_get_client())
-    model_cls = sdk.PlaceOrderRequest
-    body_obj = model_cls(**body) if isinstance(body, dict) else body
-    return _call_api(api.get_brokerage, body=body_obj, api_version=api_version)
+    return _call_api(
+        api.get_brokerage,
+        instrument_token=body.get("instrument_token", ""),
+        quantity=body.get("quantity", 0),
+        product=body.get("product", "D"),
+        transaction_type=body.get("transaction_type", "BUY"),
+        price=body.get("price", 0.0),
+        api_version=api_version,
+    )
 
 
 # -------------------------------------------------------------------------
@@ -661,21 +710,33 @@ def get_brokerage_charges(body: dict, api_version: str = "v2") -> dict:
 # -------------------------------------------------------------------------
 
 @mcp.tool()
-def get_trade_profit_and_loss(trade_type: str = "true", api_version: str = "v2") -> dict:
-    """Get trade-wise P&L report."""
+def get_trade_profit_and_loss(segment: str = "EQ", financial_year: str = "",
+                                page_number: int = 1, page_size: int = 10,
+                                api_version: str = "v2") -> dict:
+    """Get trade-wise P&L report.
+    segment: EQ, FO, CDS, MCX, BSE, BFO, etc.
+    financial_year: e.g. "2025-2026" or "FY2026"
+    """
     sdk = _load_upstox_client()
     api = sdk.TradeProfitAndLossApi(_get_client())
-    return _call_api(api.get_trade_wise_profit_and_loss,
-                     is_finished=trade_type == "true",
+    return _call_api(api.get_trade_wise_profit_and_loss_data,
+                     segment=segment, financial_year=financial_year,
+                     page_number=page_number, page_size=page_size,
                      api_version=api_version)
 
 
 @mcp.tool()
-def get_pnl_charges(api_version: str = "v2") -> dict:
-    """Get profit & loss breakdown including all charges."""
+def get_pnl_charges(segment: str = "EQ", financial_year: str = "",
+                     api_version: str = "v2") -> dict:
+    """Get profit & loss breakdown including all charges.
+    segment: EQ, FO, CDS, MCX, BSE, BFO, etc.
+    financial_year: e.g. "2025-2026" or "FY2026"
+    """
     sdk = _load_upstox_client()
-    api = sdk.ChargeApi(_get_client())
-    return _call_api(api.get_profit_and_loss_charges, api_version=api_version)
+    api = sdk.TradeProfitAndLossApi(_get_client())
+    return _call_api(api.get_profit_and_loss_charges,
+                     segment=segment, financial_year=financial_year,
+                     api_version=api_version)
 
 
 # -------------------------------------------------------------------------

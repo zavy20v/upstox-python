@@ -55,3 +55,35 @@ mcp_servers:
 ```bash
 UPSTOX_API_KEY=*** UPSTOX_API_SECRET=*** python mcp/server.py
 ```
+
+## Swagger UI / API Reference
+
+The Upstox API endpoints can be explored interactively via Swagger UI:
+
+- **Market Data**: `https://api.upstox.com/v2/market-quote/ohlc`
+- **Historical Candles**: `https://api.upstox.com/v3/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}`
+- **Option Chain**: `https://api.upstox.com/v2/option/chain`
+
+### Valid Parameter Values
+
+| Parameter | Valid Values | Notes |
+|---|---|---|
+| OHLC `interval` | `1` (min), `5`, `15`, `30`, `60` (hour), `D` (day) | Numeric = minutes |
+| Historical `interval` | `1`–`60` (minutes) or `1` with `unit=days` | Integer, not string |
+| Historical `unit` | `"minutes"`, `"days"` | Separate from interval |
+| Historical dates | `yyyy-mm-dd` | Not ISO 8601 — truncate before passing to SDK |
+| Financial Year | `"2025-2026"` | Full 4-digit year format, NOT `"2025-26"` |
+
+### Known Issues
+
+These tools make correctly-formed API calls, but reject values that can only be determined from the Upstox API documentation:
+
+- **`get_ohlc`**: Interval validation is server-side. Tried `"1"` through `"1min"` — all rejected with error code `UDAPI1028`. The correct interval format is undocumented in the SDK. Check the [Upstox API docs](https://upstox.com/developer/api-documentation) for valid values.
+- **`get_pnl_charges`** / **`get_trade_profit_and_loss`**: Financial year validation is server-side. Tried `"2025-2026"`, `"FY2026"`, `"2025-26"` — all rejected with error code `UDAPI1074`. The correct format may depend on your account type or may require a specific FY identifier from the API.
+
+- **OHLC interval**: Use V2 API. Valid values: `"1min"`, `"5min"`, `"15min"`, `"30min"`, `"1hour"`, `"1day"`. Numeric values like `"1"` or `"D"` are rejected by the API server.
+- **Historical candles**: The SDK's `get_historical_candle_data1` takes `interval` as **int** (minutes), not a string like `"1day"`. Dates must be `yyyy-mm-dd` format (truncate ISO 8601).
+- **Financial year**: The Upstox API is strict about format. Try `"2025-2026"` first; if that fails, try `"FY2026"` or `"2025"`. The exact format may depend on your account type.
+- **Option chain**: `expiry_date` is required — pass a valid date from `get_expiries` first. Past expiries return empty data.
+- **api_version**: Most SDK methods with `**kwargs` reject `api_version` as a keyword arg. The MCP server auto-strips it when the method doesn't explicitly declare it.
+- **GTT orders**: Not supported in this SDK version (2.23.0). The tools return a helpful error message.
